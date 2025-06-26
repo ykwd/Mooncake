@@ -415,7 +415,7 @@ ErrorCode Client::Put(const ObjectKey& key, std::vector<Slice>& slices,
         }
     }
 
-    const size_t value_size = 1024 * 1024;
+    const size_t value_size = 1024 * 1024 * 15;
     auto &value = kv_map_[key];
 
     auto ds = start_response.replica_list[0].buffer_descriptors[0];
