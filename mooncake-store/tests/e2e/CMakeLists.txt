@@ -15,18 +15,18 @@ if (STORE_USE_ETCD)
     add_dependencies(clientctl build_etcd_wrapper)
 endif()
 
-# add_executable(e2e_rand_test e2e_rand_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
-# target_link_libraries(e2e_rand_test PUBLIC
-#     mooncake_store
-#     cachelib_memory_allocator
-#     glog
-#     gtest
-#     pthread
-#     ${ETCD_WRAPPER_LIB}
-# )
-# if (STORE_USE_ETCD)
-#     add_dependencies(e2e_rand_test build_etcd_wrapper)
-# endif()
+add_executable(e2e_rand_test e2e_rand_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
+target_link_libraries(e2e_rand_test PUBLIC
+    mooncake_store
+    cachelib_memory_allocator
+    glog
+    gtest
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+if (STORE_USE_ETCD)
+    add_dependencies(e2e_rand_test build_etcd_wrapper)
+endif()
 
 add_executable(chaosctl chaosctl.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(chaosctl PUBLIC
