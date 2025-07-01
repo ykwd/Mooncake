@@ -2,7 +2,7 @@ name: Daily CI
 
 on:
   schedule:
-    - cron: '20 3 * * *'  # 16:00 UTC
+    - cron: '32 3 * * *'  # 16:00 UTC
   workflow_dispatch:      # allow manual trigger
 
 jobs:
