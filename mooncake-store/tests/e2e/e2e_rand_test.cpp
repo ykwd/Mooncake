@@ -11,6 +11,7 @@
 #include "process_handler.h"
 #include "types.h"
 #include "utils.h"
+#include "parse_jsonl.h"
 
 USE_engine_flags;
 FLAG_etcd_endpoints;
@@ -171,6 +172,198 @@ TEST_F(E2ERandTest, RandomSequentialDeletePutGet) {
                 }
             }
         }
+    }
+}
+
+// Test the sequential put operation from different clients.
+TEST_F(E2ERandTest, RandomSequentialPut) {
+    const int master_num = 1;
+    const int client_num = 2;
+    const int run_sec = FLAGS_run_sec;
+    const int segment_size = 1024 * 1024 * 16 * 16;
+    // Large value size to trigger bugs more easily.
+    const size_t value_size = 1024 * 1024 * 15;
+    // Large kv range to the segment is easy to be full.
+    const int kv_range = segment_size * client_num / value_size * 10;
+
+    auto gen_key = [](int key_i) { return "key_" + std::to_string(key_i); };
+
+    auto gen_value = [&](int key_i) {
+        std::string value = "value_";
+
+        // Create a deterministic pattern based on key_i
+        std::string pattern = std::to_string(key_i) + "_";
+
+        // Fill the value string with the pattern repeated to reach value_size
+        while (value.size() < value_size) {
+            value += pattern;
+        }
+
+        // Trim to exactly value_size
+        value.resize(value_size);
+
+        return value;
+    };
+
+    // Store the kv pairs to make generate operations faster.
+    std::unordered_map<std::string, std::string> kv_map;
+    for (int i = 0; i < kv_range; ++i) {
+        kv_map[gen_key(i)] = gen_value(i);
+    }
+
+    // Start masters
+    std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
+        masters;
+    for (int i = 0; i < master_num; ++i) {
+        masters.emplace_back(
+            std::make_unique<mooncake::testing::MasterProcessHandler>(
+                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
+                i, FLAGS_out_dir));
+        ASSERT_TRUE(masters.back()->start());
+    }
+
+    // Wait for the leader to be elected
+    WaitMasterViewChange();
+
+    // Create clients
+    std::vector<std::shared_ptr<ClientTestWrapper>> clients;
+    std::vector<std::vector<void*>> client_segments;
+    for (int i = 0; i < client_num; ++i) {
+        clients.emplace_back(CreateClientWrapper(
+            "0.0.0.0:" + std::to_string(client_port_base + i)));
+        ASSERT_TRUE(clients.back() != nullptr);
+        client_segments.emplace_back();
+        // Mount a segment
+        void* buffer;
+        ASSERT_EQ(clients.back()->Mount(segment_size, buffer), ErrorCode::OK);
+        client_segments.back().emplace_back(buffer);
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+    while (true) {
+        // Check if we've exceeded the run time
+        auto current_time = std::chrono::steady_clock::now();
+        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                   current_time - start_time)
+                                   .count();
+        if (elapsed_seconds >= run_sec) {
+            break;
+        }
+
+        // For randomly selected kv pairs, put them.
+        for (int i = 0; i < kv_range; ++i) {
+            if (rand() % 100 < 50) {
+                continue;
+            }
+            auto key = gen_key(i);
+            auto& value = kv_map[key];
+            clients[rand() % client_num]->Put(key, value);
+        }
+    }
+}
+
+// Test the sequential put operation directly to the master.
+TEST_F(E2ERandTest, RandomSequentialPutToMaster) {
+    const int run_sec = FLAGS_run_sec;
+    const size_t segment_size = 1024ull * 1024 * 1024 * 256;
+    // Large kv range to the segment is easy to be full.
+    const int kv_range = 100000;
+
+    auto gen_key = [](int key_i) { return "key_" + std::to_string(key_i); };
+    auto gen_value_size_ = []() {
+         return rand() % (1024 * 1024 * 256); };
+
+        std::thread metric_report_thread([this]() {
+            while (true) {
+                std::string metrics_summary =
+                    MasterMetricManager::instance().get_summary_string();
+                std::cout << "Master Metrics: " << metrics_summary << std::endl;
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(kMetricReportIntervalSeconds));
+            }
+        });
+    std::vector<int> input_lengths = parseInputLengths("./conversation_trace.jsonl");
+    //for (int i = 0; i < 100; i++) {
+    //    std::cout << "Input length: " << input_lengths[i] << std::endl;
+    //}
+    //exit(0);
+
+    MasterService service;
+
+    // Mount segment and put an object
+    constexpr size_t buffer = 0x300000000;
+    std::string segment_name = "test_segment";
+    Segment segment(generate_uuid(), segment_name, buffer, segment_size);
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    auto start_time = std::chrono::steady_clock::now();
+    long success_count = 0;
+    long failed_count = 0;
+    int round = 0;
+    while (true) {
+        // Check if we've exceeded the run time
+        auto current_time = std::chrono::steady_clock::now();
+        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                   current_time - start_time)
+                                   .count();
+        if (elapsed_seconds >= run_sec) {
+            break;
+        }
+
+        // For randomly selected kv pairs, put them.
+        /*
+        for (int i = 0; i < 100; ++i) {
+            auto key = gen_key(rand() % kv_range);
+            auto value_size = gen_value_size();
+            auto left_value_size = value_size;
+            std::vector<uint64_t> slice_lengths;
+            while (left_value_size > 0) {
+                uint64_t slice_length = std::min(static_cast<uint64_t>(left_value_size), kMaxSliceSize);
+                slice_lengths.push_back(slice_length);
+                left_value_size -= slice_length;
+            }
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.with_soft_pin = false;
+
+            if (service.PutStart(key, value_size, slice_lengths, config).has_value()) {
+                success_count++;
+                service.PutEnd(key);
+            } else {
+                failed_count++;
+            }            
+        }*/
+        for (auto input_length : input_lengths) {
+            for (int i = 0; i < 64; i++) {
+                auto key = gen_key(rand() % kv_range);
+                auto value_size = input_length * 8192;
+                auto left_value_size = value_size;
+                std::vector<uint64_t> slice_lengths;
+                            while (left_value_size > 0) {
+                    uint64_t slice_length = std::min(static_cast<uint64_t>(left_value_size), kMaxSliceSize);
+                    slice_lengths.push_back(slice_length);
+                    left_value_size -= slice_length;
+                }
+                ReplicateConfig config;
+                config.replica_num = 1;
+                config.with_soft_pin = false;
+
+                MasterMetricManager::instance().inc_put_start_requests();
+                if (service.PutStart(key, value_size, slice_lengths, config).has_value()) {
+                    success_count++;
+                    service.PutEnd(key);
+                    MasterMetricManager::instance().inc_put_end_requests();
+                } else {
+                    failed_count++;
+                    MasterMetricManager::instance().inc_put_start_failures();
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        round++;
+        std::cout << "Round: " << round << ", Success count: " << success_count << ", Failed count: " << failed_count << std::endl;
+        // std::cout << "Success count: " << success_count << ", Failed count: " << failed_count << std::endl;
     }
 }
 
