@@ -56,3 +56,6 @@ if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)
   message(STATUS "P2P Store will be built")
 endif()
+
+# Add exp directory for token distribution analysis
+add_subdirectory(exp)
