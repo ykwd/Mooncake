@@ -62,3 +62,6 @@ if (STORE_USE_ETCD)
 endif()
 
 install(TARGETS mooncake_master DESTINATION bin)
+
+add_executable(test_numa test_numa.cpp)
+target_link_libraries(test_numa PRIVATE glog::glog numa pthread)
