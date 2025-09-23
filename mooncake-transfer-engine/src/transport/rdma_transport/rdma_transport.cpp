@@ -92,23 +92,59 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     const static int access_rights = IBV_ACCESS_LOCAL_WRITE |
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
+    uint64_t global_start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+    // Parallelize memory region registration across all contexts
+    std::vector<std::future<int>> registration_futures;
+    
+    // Launch parallel registration tasks
     for (auto &context : context_list_) {
-        int ret = context->registerMemoryRegion(addr, length, access_rights);
+        registration_futures.emplace_back(
+            std::async(std::launch::async, [&context, addr, length]() -> int {
+                uint64_t start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+                int ret = context->registerMemoryRegion(addr, length, access_rights);
+                printf("\tRegister memory region time taken: %lld ms\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count() - start_time));
+                return ret;
+            }));
+    }
+    
+    // Wait for all registrations to complete and check for errors
+    for (size_t i = 0; i < registration_futures.size(); ++i) {
+        int ret = registration_futures[i].get();
         if (ret) return ret;
-        buffer_desc.lkey.push_back(context->lkey(addr));
-        buffer_desc.rkey.push_back(context->rkey(addr));
+        
+        // Get lkey and rkey after successful registration
+        buffer_desc.lkey.push_back(context_list_[i]->lkey(addr));
+        buffer_desc.rkey.push_back(context_list_[i]->rkey(addr));
     }
 
     // Get the memory location automatically after registered MR(pinned),
     // when the name is kWildcardLocation("*").
     if (name == kWildcardLocation) {
+        uint64_t start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length);
+        printf("\tGet memory location time taken: %lld ms\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count() - start_time));
+        start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
         if (entries.empty()) return -1;
         buffer_desc.name = entries[0].location;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+        printf("\tAdd local memory buffer time taken: %lld ms\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count() - start_time));
         if (rc) return rc;
     } else {
         buffer_desc.name = name;
@@ -118,6 +154,9 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
 
         if (rc) return rc;
     }
+    printf("Total time taken: %lld ms\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count() - global_start_time));
 
     return 0;
 }

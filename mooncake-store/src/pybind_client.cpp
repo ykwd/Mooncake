@@ -216,8 +216,12 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         current_glbseg_size += segment_size;
         LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                   << current_glbseg_size << " of " << total_glbseg_size;
-        void *ptr =
-            allocate_buffer_allocator_memory(segment_size, this->protocol);
+        uint64_t start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+        void *ptr =  mmap(nullptr, segment_size, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+            // allocate_buffer_allocator_memory(segment_size, this->protocol);
         if (!ptr) {
             LOG(ERROR) << "Failed to allocate segment memory";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -235,12 +239,14 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         size_t threads_by_size = segment_size / kMinBytesPerThread;  // floor
         size_t num_threads =
             std::min(max_threads, std::max<size_t>(threads_by_size, 1));
+        printf("Num threads: %zu, max threads: %zu, threads by size: %zu\n", num_threads, max_threads, threads_by_size);
+        printf("page size: %zu\n", page_size);
 
         if (threads_by_size < 1 || num_threads == 1) {
             // Too small to benefit from threading; touch inline.
             for (size_t offset = 0; offset < segment_size;
                  offset += page_size) {
-                static_cast<char *>(ptr)[offset] = 0;
+                //static_cast<char *>(ptr)[offset] = 0;
             }
         } else {
             std::vector<std::thread> threads;
@@ -267,6 +273,12 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
                 }
             }
         }
+        printf("Touch time taken: %lld ms\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count() - start_time));
+        start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
 
         if (this->protocol == "ascend") {
             ascend_segment_ptrs_.emplace_back(ptr);
@@ -279,6 +291,9 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
         }
+        printf("Mount time taken: %lld ms\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count() - start_time));
     }
     if (total_glbseg_size == 0) {
         LOG(INFO) << "Global segment size is 0, skip mounting segment";
