@@ -292,21 +292,14 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterClient::PutStart(const std::string& key,
-                       const std::vector<size_t>& slice_lengths,
+                       const uint64_t slice_length,
                        const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::PutStart");
-    timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
-
-    // Convert size_t to uint64_t for RPC
-    std::vector<uint64_t> rpc_slice_lengths;
-    rpc_slice_lengths.reserve(slice_lengths.size());
-    for (const auto& length : slice_lengths) {
-        rpc_slice_lengths.push_back(length);
-    }
+    timer.LogRequest("key=", key, ", slice_length=", slice_length);
 
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
-        client_id_, key, rpc_slice_lengths, config);
+        client_id_, key, slice_length, config);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -314,7 +307,7 @@ MasterClient::PutStart(const std::string& key,
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 MasterClient::BatchPutStart(
     const std::vector<std::string>& keys,
-    const std::vector<std::vector<uint64_t>>& slice_lengths,
+    const std::vector<uint64_t>& slice_lengths,
     const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
     timer.LogRequest("keys_count=", keys.size());

@@ -309,15 +309,15 @@ class MemcpyWorkerPool {
 struct FilereadTask {
     std::string file_path;
     size_t object_size;
-    std::vector<Slice> slices;
+    Slice slice;
     std::shared_ptr<FilereadOperationState> state;
 
     FilereadTask(const std::string& path, size_t size,
-                 const std::vector<Slice>& slices_ref,
+                 const Slice& slice_ref,
                  std::shared_ptr<FilereadOperationState> s)
         : file_path(path),
           object_size(size),
-          slices(slices_ref),
+          slice(slice_ref),
           state(std::move(s)) {}
 };
 
@@ -376,13 +376,13 @@ class TransferSubmitter {
      * that can be used to track completion and get results.
      *
      * @param handles Buffer descriptors for the transfer
-     * @param slices Memory slices for the transfer
+     * @param slice Memory slice for the transfer
      * @param op_code Transfer operation (READ/WRITE)
      * @return TransferFuture representing the async operation, or nullopt on
      * failure
      */
     std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
-                                         std::vector<Slice>& slices,
+                                         const Slice& slice,
                                          TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submit_batch(
@@ -401,38 +401,40 @@ class TransferSubmitter {
      * @brief Select the optimal transfer strategy
      */
     TransferStrategy selectStrategy(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices) const;
+        const AllocatedBuffer::Descriptor& handle) const;
 
     /**
-     * @brief Check if all handles refer to local segments
+     * @brief Check if the handle refers to local segments
      */
     bool isLocalTransfer(
-        const std::vector<AllocatedBuffer::Descriptor>& handles) const;
+        const AllocatedBuffer::Descriptor& handle) const;
 
     /**
      * @brief Validate transfer parameters
      */
     bool validateTransferParams(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices, bool is_multi_buffers = false) const;
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices) const;
+    bool validateTransferParams(
+        const AllocatedBuffer::Descriptor& handle,
+        const Slice& slice) const;
 
     /**
      * @brief Submit memcpy operation asynchronously
      */
     std::optional<TransferFuture> submitMemcpyOperation(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
+        const AllocatedBuffer::Descriptor& handle,
+        const Slice& slice, TransferRequest::OpCode op_code);
 
     /**
      * @brief Submit transfer engine operation asynchronously
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
+        const AllocatedBuffer::Descriptor& handle,
+        const Slice& slice, TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
-        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        const Replica::Descriptor& replica, const Slice& slice,
         TransferRequest::OpCode op_code);
 
     /**
@@ -440,6 +442,8 @@ class TransferSubmitter {
      */
     void updateTransferMetrics(const std::vector<Slice>& slices,
                                TransferRequest::OpCode op);
+    void updateTransferMetrics(const Slice& slice,
+                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
         std::vector<TransferRequest>& requests);

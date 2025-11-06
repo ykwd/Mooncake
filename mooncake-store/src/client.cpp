@@ -408,17 +408,17 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
-                                          std::vector<Slice>& slices) {
+                                          const Slice& slice) {
     auto query_result = Query(object_key);
     if (!query_result) {
         return tl::unexpected(query_result.error());
     }
-    return Get(object_key, query_result.value(), slices);
+    return Get(object_key, query_result.value(), slice);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
-    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    const std::unordered_map<std::string, Slice>& slices) {
     auto batched_query_results = BatchQuery(object_keys);
 
     // If any queries failed, return error results immediately for failed
@@ -444,7 +444,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     // If we have any valid queries, process them
     if (!valid_keys.empty()) {
-        std::unordered_map<std::string, std::vector<Slice>> valid_slices;
+        std::unordered_map<std::string, Slice> valid_slices;
         for (const auto& key : valid_keys) {
             auto it = slices.find(key);
             if (it != slices.end()) {
@@ -519,7 +519,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
-                                          std::vector<Slice>& slices) {
+                                          const Slice& slice) {
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -531,7 +531,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferRead(replica, slices);
+    err = TransferRead(replica, slice);
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -562,6 +562,29 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        return results;
+    }
+
+    // Validate input size consistency
+    if (query_results.size() != object_keys.size()) {
+        LOG(ERROR) << "Query results size (" << query_results.size()
+                    << ") doesn't match object keys size (" << object_keys.size()
+                    << ")";
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        return results;
+    }
+    
     std::vector<tl::expected<void, ErrorCode>> results;
     results.resize(object_keys.size());
 
@@ -589,11 +612,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             continue;
         }
         auto& memory_descriptor = replica.get_memory_descriptor();
-        if (memory_descriptor.buffer_descriptors.empty()) {
-            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
-            continue;
-        }
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         auto& op = seg_to_op_map[seg];
         op.replicas.emplace_back(replica);
@@ -640,8 +659,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
-    std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool prefer_alloc_in_same_node) {
+    const std::unordered_map<std::string, Slice>& slices) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -663,9 +681,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         return results;
-    }
-    if (prefer_alloc_in_same_node) {
-        return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
     // Collect all transfer operations for parallel execution
@@ -752,16 +767,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 }
 
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
-                                          std::vector<Slice>& slices,
+                                          const Slice& slice,
                                           const ReplicateConfig& config) {
-    // Prepare slice lengths
-    std::vector<size_t> slice_lengths;
-    for (size_t i = 0; i < slices.size(); ++i) {
-        slice_lengths.emplace_back(slices[i].size);
-    }
-
     // Start put operation
-    auto start_result = master_client_.PutStart(key, slice_lengths, config);
+    auto start_result = master_client_.PutStart(key, slice.size, config);
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -790,7 +799,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             if (replica.is_disk_replica()) {
                 // Store to local file if storage backend is available
                 auto disk_descriptor = replica.get_disk_descriptor();
-                PutToLocalFile(key, slices, disk_descriptor);
+                PutToLocalFile(key, slice, disk_descriptor);
                 break;  // Only one disk replica is needed
             }
         }
@@ -799,7 +808,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     for (const auto& replica : start_result.value()) {
         if (replica.is_memory_replica()) {
             // Transfer data using allocated handles from all replicas
-            ErrorCode transfer_err = TransferWrite(replica, slices);
+            ErrorCode transfer_err = TransferWrite(replica, slice);
             if (transfer_err != ErrorCode::OK) {
                 // Revoke put operation
                 auto revoke_result =
@@ -842,17 +851,20 @@ enum class PutOperationState {
 
 class PutOperation {
    public:
-    PutOperation(std::string_view k, const std::vector<Slice>& s)
-        : key(k), slices(s) {
-        value_length = CalculateSliceSize(slices);
+    PutOperation(std::string_view k, const Slice s)
+        : key(k), slice(s) {
+        // Initialize with a pending error state to ensure result is always set
+        result = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    PutOperation(std::string_view k)
+        : key(k) {
         // Initialize with a pending error state to ensure result is always set
         result = tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     std::string key;
-    std::vector<Slice> slices;
-    size_t value_length;
-    std::vector<std::vector<Slice>> batched_slices;
+    Slice slice; // for single slice put
+    std::vector<std::vector<Slice>> batched_slices; // for multi-slice put
 
     // Enhanced state tracking
     PutOperationState state = PutOperationState::PENDING;
@@ -894,34 +906,17 @@ class PutOperation {
     }
 };
 
-std::vector<PutOperation> Client::CreatePutOperations(
-    const std::vector<ObjectKey>& keys,
-    const std::vector<std::vector<Slice>>& batched_slices) {
-    std::vector<PutOperation> ops;
-    ops.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        ops.emplace_back(keys[i], batched_slices[i]);
-    }
-    return ops;
-}
-
 void Client::StartBatchPut(std::vector<PutOperation>& ops,
                            const ReplicateConfig& config) {
     std::vector<std::string> keys;
-    std::vector<std::vector<uint64_t>> slice_lengths;
+    std::vector<uint64_t> slice_lengths;
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
 
     for (const auto& op : ops) {
         keys.emplace_back(op.key);
-
-        std::vector<uint64_t> slice_sizes;
-        slice_sizes.reserve(op.slices.size());
-        for (const auto& slice : op.slices) {
-            slice_sizes.emplace_back(slice.size);
-        }
-        slice_lengths.emplace_back(std::move(slice_sizes));
+        slice_lengths.emplace_back(op.slice.size);
     }
 
     auto start_responses =
@@ -987,7 +982,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                 const auto& replica = *it;
                 if (replica.is_disk_replica()) {
                     auto disk_descriptor = replica.get_disk_descriptor();
-                    PutToLocalFile(op.key, op.slices, disk_descriptor);
+                    PutToLocalFile(op.key, op.slice, disk_descriptor);
                     break;  // Only one disk replica is needed
                 }
             }
@@ -998,7 +993,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
             const auto& replica = op.replicas[replica_idx];
             if (replica.is_memory_replica()) {
                 auto submit_result = transfer_submitter_->submit(
-                    replica, op.slices, TransferRequest::WRITE);
+                    replica, op.slice, TransferRequest::WRITE);
 
                 if (!submit_result) {
                     failure_context = "Failed to submit transfer for replica " +
@@ -1222,8 +1217,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
-    std::vector<PutOperation>& ops) {
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config) {
     auto t0 = std::chrono::steady_clock::now();
+    std::vector<PutOperation> ops;
+    ops.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ops.emplace_back(keys[i]);
+    }
+    if (config.replica_num != 1) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                        "replica_num != 1";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    StartBatchPut(ops, config);
     std::unordered_map<std::string, PutOperation> seg_to_ops{};
     for (auto& op : ops) {
         if (op.IsResolved()) {
@@ -1240,12 +1249,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
             continue;
         }
         auto& memory_descriptor = replica.get_memory_descriptor();
-        if (memory_descriptor.buffer_descriptors.empty()) {
-            op.SetError(ErrorCode::INVALID_PARAMS,
-                        "buffer descriptors is empty.");
-            continue;
-        }
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         if (seg_to_ops.find(seg) == seg_to_ops.end()) {
             seg_to_ops.emplace(seg, PutOperation(op.key, op.slices));
@@ -1286,7 +1290,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
     WaitForTransfers(merged_ops);
     for (auto& op : merged_ops) {
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         seg_to_ops.at(seg).state = op.state;
     }
@@ -1295,7 +1299,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
             continue;
         }
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         op.state = seg_to_ops.at(seg).state;
         auto state = std::make_shared<EmptyOperationState>();
@@ -1314,18 +1318,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
-    std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<Slice>& batched_slices,
     const ReplicateConfig& config) {
-    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    if (config.prefer_alloc_in_same_node) {
-        if (config.replica_num != 1) {
-            LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
-                          "replica_num != 1";
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        StartBatchPut(ops, config);
-        return BatchPutWhenPreferSameNode(ops);
+    std::vector<PutOperation> ops;
+    ops.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ops.emplace_back(keys[i], batched_slices[i]);
     }
     StartBatchPut(ops, config);
 
@@ -1534,14 +1532,9 @@ void Client::PrepareStorageBackend(const std::string& storage_root_dir,
 }
 
 void Client::PutToLocalFile(const std::string& key,
-                            const std::vector<Slice>& slices,
+                            const Slice& slice,
                             const DiskDescriptor& disk_descriptor) {
     if (!storage_backend_) return;
-
-    size_t total_size = 0;
-    for (const auto& slice : slices) {
-        total_size += slice.size;
-    }
 
     std::string path = disk_descriptor.file_path;
     // Currently, persistence is achieved through asynchronous writes, but
@@ -1551,11 +1544,7 @@ void Client::PutToLocalFile(const std::string& key,
     // Future plans include introducing a reuse buffer list to address this
     // performance degradation issue.
 
-    std::string value;
-    value.reserve(total_size);
-    for (const auto& slice : slices) {
-        value.append(static_cast<char*>(slice.ptr), slice.size);
-    }
+    std::string value(static_cast<char*>(slice.ptr), slice.size);
 
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
@@ -1582,7 +1571,7 @@ void Client::PutToLocalFile(const std::string& key,
 }
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices,
+                               const Slice& slice,
                                TransferRequest::OpCode op_code) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
@@ -1590,7 +1579,7 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     }
 
     auto future =
-        transfer_submitter_->submit(replica_descriptor, slices, op_code);
+        transfer_submitter_->submit(replica_descriptor, slice, op_code);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return ErrorCode::TRANSFER_FAIL;
@@ -1602,31 +1591,28 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 }
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices) {
-    return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+                                const Slice& slice) {
+    return TransferData(replica_descriptor, slice, TransferRequest::WRITE);
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices) {
+                               const Slice& slice) {
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
-        for (const auto& handle : mem_desc.buffer_descriptors) {
-            total_size += handle.size_;
-        }
+        total_size = mem_desc.buffer_descriptor.size_;
     } else {
         auto& disk_desc = replica_descriptor.get_disk_descriptor();
         total_size = disk_desc.object_size;
     }
 
-    size_t slices_size = CalculateSliceSize(slices);
-    if (slices_size < total_size) {
-        LOG(ERROR) << "Slice size " << slices_size << " is smaller than total "
+    if (slice.size < total_size) {
+        LOG(ERROR) << "Slice size " << slice.size << " is smaller than total "
                    << "size " << total_size;
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return TransferData(replica_descriptor, slices, TransferRequest::READ);
+    return TransferData(replica_descriptor, slice, TransferRequest::READ);
 }
 
 void Client::PingThreadMain(bool is_ha_mode,

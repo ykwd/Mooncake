@@ -84,7 +84,7 @@ class Client {
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
-                                      std::vector<Slice>& slices);
+                                      const Slice& slice);
 
     /**
      * @brief Batch retrieve data for multiple keys
@@ -93,6 +93,23 @@ class Client {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
+        const std::unordered_map<std::string, Slice>& slices);
+    
+    /**
+     * @brief Transfers data using pre-queried object information
+     * @param object_keys Keys of the objects
+     * @param query_results Previously queried object metadata for each key
+     * @param slices Map of object keys to their data slices
+     * @return Vector of ErrorCode results for each object
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchGet(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        const std::unordered_map<std::string, Slice>& slices);
+    
+    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
 
     /**
@@ -128,46 +145,39 @@ class Client {
      * @param object_key Key of the object
      * @param query_result Previously queried object metadata containing
      * replicas and lease timeout
-     * @param slices Vector of slices to store the data
+     * @param slice Data slice to get
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
-                                      std::vector<Slice>& slices);
-    /**
-     * @brief Transfers data using pre-queried object information
-     * @param object_keys Keys of the objects
-     * @param query_results Previously queried object metadata for each key
-     * @param slices Map of object keys to their data slices
-     * @return Vector of ErrorCode results for each object
-     */
-    std::vector<tl::expected<void, ErrorCode>> BatchGet(
-        const std::vector<std::string>& object_keys,
-        const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+                                      const Slice& slice);
 
     /**
      * @brief Stores data with replication
      * @param key Object key
-     * @param slices Vector of data slices to store
+     * @param slice Data slice to put
      * @param config Replication configuration
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
-                                      std::vector<Slice>& slices,
+                                      const Slice& slice,
                                       const ReplicateConfig& config);
 
     /**
      * @brief Batch put data with replication
      * @param keys Object keys
-     * @param batched_slices Vector of vectors of data slices to store (indexed
+     * @param batched_slices Vector of data slices to store (indexed
      * to match keys)
      * @param config Replication configuration
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
-        std::vector<std::vector<Slice>>& batched_slices,
+        const std::vector<Slice>& batched_slices,
+        const ReplicateConfig& config);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
 
     /**
@@ -285,12 +295,12 @@ class Client {
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices,
+                           const Slice& slice,
                            TransferRequest::OpCode op_code);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices);
+                            const Slice& slice);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
+                           const Slice& slice);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -299,7 +309,7 @@ class Client {
                                const std::string& fsdir);
 
     void PutToLocalFile(const std::string& object_key,
-                        const std::vector<Slice>& slices,
+                        const Slice& slice,
                         const DiskDescriptor& disk_descriptor);
 
     /**
@@ -316,9 +326,6 @@ class Client {
     /**
      * @brief Batch put helper methods for structured approach
      */
-    std::vector<PutOperation> CreatePutOperations(
-        const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>& batched_slices);
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void SubmitTransfers(std::vector<PutOperation>& ops);
@@ -326,13 +333,6 @@ class Client {
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
-
-    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
-        std::vector<PutOperation>& ops);
-    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
-        const std::vector<std::string>& object_keys,
-        const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
 
     // Client identification
     const UUID client_id_;
