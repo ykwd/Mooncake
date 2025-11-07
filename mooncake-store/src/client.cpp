@@ -852,19 +852,30 @@ enum class PutOperationState {
 class PutOperation {
    public:
     PutOperation(std::string_view k, const Slice s)
-        : key(k), slice(s) {
+        : key(k), slice(s), total_slice_length(s.size) {
         // Initialize with a pending error state to ensure result is always set
         result = tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    PutOperation(std::string_view k)
-        : key(k) {
+    PutOperation(std::string_view k, const std::vector<Slice>& s)
+        : key(k), multi_slices(), total_slice_length(0) {
+        multi_slices.emplace_back(s);
+        for (const auto& slice : multi_slices[0]) {
+            total_slice_length += slice.size;
+        }
         // Initialize with a pending error state to ensure result is always set
         result = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    void extend_multi_slices(const std::vector<Slice>& s) {
+        multi_slices.emplace_back(s);
+        for (const auto& slice : multi_slices[0]) {
+            total_slice_length += slice.size;
+        }
     }
 
     std::string key;
     Slice slice; // for single slice put
-    std::vector<std::vector<Slice>> batched_slices; // for multi-slice put
+    std::vector<std::vector<Slice>> multi_slices; // for multi-slice put
+    uint64_t total_slice_length; // The total length of all slices
 
     // Enhanced state tracking
     PutOperationState state = PutOperationState::PENDING;
@@ -916,7 +927,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
 
     for (const auto& op : ops) {
         keys.emplace_back(op.key);
-        slice_lengths.emplace_back(op.slice.size);
+        slice_lengths.emplace_back(op.total_slice_length);
     }
 
     auto start_responses =
@@ -1224,7 +1235,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
     std::vector<PutOperation> ops;
     ops.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        ops.emplace_back(keys[i]);
+        ops.emplace_back(keys[i], batched_slices[i]);
     }
     if (config.replica_num != 1) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
@@ -1252,23 +1263,24 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         if (seg_to_ops.find(seg) == seg_to_ops.end()) {
-            seg_to_ops.emplace(seg, PutOperation(op.key, op.slices));
+            seg_to_ops.emplace(seg, PutOperation(op.key, op.multi_slices[0]));
         }
         // multiple replica-slices
-        seg_to_ops.at(seg).batched_slices.emplace_back(op.slices);
+        seg_to_ops.at(seg).extend_multi_slices(op.multi_slices[0]);
         seg_to_ops.at(seg).replicas.emplace_back(replica);
     }
     std::vector<PutOperation> merged_ops;
     merged_ops.reserve(seg_to_ops.size());
     for (auto& seg_to_op : seg_to_ops) {
         auto& op = seg_to_op.second;
+        merged_ops.emplace_back(std::move(op));
+    }
+   
+    for (auto& merged_op : merged_ops) {
         bool all_transfers_submitted = true;
         std::string failure_context;
-        merged_ops.emplace_back(op.key, op.slices);
-        auto& merged_op = merged_ops.back();
-        merged_op.replicas = op.replicas;
         auto submit_result = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::WRITE);
+            merged_op.replicas, merged_op.multi_slices, TransferRequest::WRITE);
         if (!submit_result) {
             failure_context = "Failed to submit batch transfer";
             all_transfers_submitted = false;
@@ -1277,14 +1289,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
                 std::move(submit_result.value()));
         }
         if (!all_transfers_submitted) {
-            LOG(ERROR) << "Transfer submission failed for key " << op.key
+            LOG(ERROR) << "Transfer submission failed for key " << merged_op.key
                        << ": " << failure_context;
             merged_op.SetError(ErrorCode::TRANSFER_FAIL, failure_context);
             merged_op.pending_transfers.clear();
         } else {
             VLOG(1) << "Successfully submitted "
                     << merged_op.pending_transfers.size()
-                    << " transfers for key " << merged_ops.back().key;
+                    << " transfers for key " << merged_op.key;
         }
     }
     WaitForTransfers(merged_ops);

@@ -94,7 +94,7 @@ void FilereadWorkerPool::workerThread() {
                 }
 
                 auto load_result = backend_->LoadObject(
-                    task.file_path, task.slices, task.object_size);
+                    task.file_path, task.slice, task.object_size);
                 if (load_result) {
                     VLOG(2) << "Fileread task completed successfully with "
                             << task.file_path;

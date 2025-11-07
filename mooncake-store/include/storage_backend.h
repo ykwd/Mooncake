@@ -139,12 +139,12 @@ class StorageBackend {
     /**
      * @brief Loads an object into slices
      * @param path path for the object
-     * @param slices Output vector for loaded data slices
+     * @param slice Output slice for loaded data
      * @param length Expected length of data to read
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
     tl::expected<void, ErrorCode> LoadObject(const std::string& path,
-                                             std::vector<Slice>& slices,
+                                             const Slice& slice,
                                              int64_t length);
 
     /**

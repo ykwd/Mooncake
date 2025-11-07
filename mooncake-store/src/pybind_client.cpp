@@ -317,10 +317,9 @@ tl::expected<void, ErrorCode> PyClient::put_internal(
     }
     auto &buffer_handle = *alloc_result;
     memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+    auto slice = Slice{buffer_handle.ptr(), buffer_handle.size()};
 
-    std::vector<Slice> slices = split_into_slices(buffer_handle);
-
-    auto put_result = client_->Put(key, slices, config);
+    auto put_result = client_->Put(key, slice, config);
     if (!put_result) {
         return tl::unexpected(put_result.error());
     }
@@ -350,7 +349,7 @@ tl::expected<void, ErrorCode> PyClient::put_batch_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     std::vector<BufferHandle> buffer_handles;
-    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    std::unordered_map<std::string, Slice> batched_slices;
     batched_slices.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -366,13 +365,13 @@ tl::expected<void, ErrorCode> PyClient::put_batch_internal(
         }
         auto &buffer_handle = *alloc_result;
         memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
-        auto slices = split_into_slices(buffer_handle);
+        auto slice = Slice{buffer_handle.ptr(), buffer_handle.size()};
         buffer_handles.emplace_back(std::move(*alloc_result));
-        batched_slices.emplace(key, std::move(slices));
+        batched_slices.emplace(key, std::move(slice));
     }
 
     // Convert unordered_map to vector format expected by BatchPut
-    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
+    std::vector<mooncake::Slice> ordered_batched_slices;
     ordered_batched_slices.reserve(keys.size());
     for (const auto &key : keys) {
         auto it = batched_slices.find(key);
@@ -442,11 +441,8 @@ tl::expected<void, ErrorCode> PyClient::put_parts_internal(
         offset += value.size_bytes();
     }
 
-    // Split into slices
-    std::vector<Slice> slices = split_into_slices(buffer_handle);
-
     // Perform the put operation - buffer_handle will be automatically released
-    auto put_result = client_->Put(key, slices, config);
+    auto put_result = client_->Put(key, Slice{buffer_handle.ptr(), buffer_handle.size()}, config);
     if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
                    << toString(put_result.error());
@@ -557,7 +553,7 @@ tl::expected<int64_t, ErrorCode> PyClient::getSize_internal(
     int64_t total_size = 0;
     if (!replica_list.empty()) {
         auto &replica = replica_list[0];
-        total_size = calculate_total_size(replica);
+        total_size = getSliceSize(replica);
     } else {
         LOG(ERROR) << "Internal error: replica_list is empty";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);  // Internal error
@@ -597,7 +593,7 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
     }
 
     const auto &replica = replica_list[0];
-    uint64_t total_length = calculate_total_size(replica);
+    uint64_t total_length = getSliceSize(replica);
 
     if (total_length == 0) {
         return nullptr;
@@ -613,11 +609,10 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
     auto &buffer_handle = *alloc_result;
 
     // Create slices for the allocated buffer
-    std::vector<Slice> slices;
-    allocateSlices(slices, replica, buffer_handle);
+    auto slice = Slice{buffer_handle.ptr(), buffer_handle.size()};
 
     // Get the object data
-    auto get_result = client_->Get(key, query_result.value(), slices);
+    auto get_result = client_->Get(key, query_result.value(), slice);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
@@ -653,7 +648,7 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
         std::string key;
         QueryResult query_result;
         std::unique_ptr<BufferHandle> buffer_handle;
-        std::vector<Slice> slices;
+        Slice slice;
     };
     std::vector<KeyOp> valid_ops;
     valid_ops.reserve(keys.size());
@@ -677,7 +672,7 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
         }
 
         const auto &replica = query_result_values.replicas[0];
-        uint64_t total_size = calculate_total_size(replica);
+        uint64_t total_size = getSliceSize(replica);
         if (total_size == 0) {
             continue;
         }
@@ -690,15 +685,14 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
 
         auto buffer_handle =
             std::make_unique<BufferHandle>(std::move(*alloc_result));
-        std::vector<Slice> slices;
-        allocateSlices(slices, replica, *buffer_handle);
+        auto slice = Slice{buffer_handle->ptr(), buffer_handle->size()};
 
         valid_ops.emplace_back(
             KeyOp{.original_index = i,
                   .key = key,
                   .query_result = std::move(query_result_values),
                   .buffer_handle = std::move(buffer_handle),
-                  .slices = std::move(slices)});
+                  .slice = std::move(slice)});
     }
 
     if (valid_ops.empty()) {
@@ -708,14 +702,14 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
     // 3. Execute batch get
     std::vector<std::string> batch_keys;
     std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+    std::unordered_map<std::string, Slice> batch_slices;
     batch_keys.reserve(valid_ops.size());
     batch_query_results.reserve(valid_ops.size());
 
     for (auto &op : valid_ops) {
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
-        batch_slices[op.key] = op.slices;
+        batch_slices[op.key] = op.slice;
     }
 
     auto batch_get_results =
@@ -807,7 +801,7 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     }
 
     auto &replica = replica_list[0];
-    uint64_t total_size = calculate_total_size(replica);
+    uint64_t total_size = getSliceSize(replica);
 
     // Check if user buffer is large enough
     if (size < total_size) {
@@ -816,29 +810,12 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Step 2: Split user buffer according to object info and create
-    // slices
-    std::vector<mooncake::Slice> slices;
-    uint64_t offset = 0;
-
-    if (replica.is_memory_replica() == false) {
-        while (offset < total_size) {
-            auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
-        }
-    } else {
-        for (auto &handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
-            slices.emplace_back(Slice{chunk_ptr, handle.size_});
-            offset += handle.size_;
-        }
-    }
+    // Step 2: Create slice from user buffer
+    auto slice_size = getSliceSize(replica);
+    auto slice = Slice{buffer, slice_size};
 
     // Step 3: Read data directly into user buffer
-    auto get_result = client_->Get(key, query_result.value(), slices);
+    auto get_result = client_->Get(key, query_result.value(), slice);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
@@ -890,7 +867,7 @@ std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
+    std::unordered_map<std::string, Slice> all_slices;
 
     // Create slices from user buffers
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -898,20 +875,12 @@ std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
         void *buffer = buffers[i];
         size_t size = sizes[i];
 
-        std::vector<mooncake::Slice> slices;
-        uint64_t offset = 0;
+        auto slice = Slice{buffer, size};
 
-        while (offset < size) {
-            auto chunk_size = std::min(size - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
-        }
-
-        all_slices[key] = std::move(slices);
+        all_slices[key] = std::move(slice);
     }
 
-    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
+    std::vector<Slice> ordered_batched_slices;
     ordered_batched_slices.reserve(keys.size());
     for (const auto &key : keys) {
         auto it = all_slices.find(key);
@@ -948,17 +917,9 @@ tl::expected<void, ErrorCode> PyClient::put_from_internal(
     }
 
     // Create slices directly from the user buffer
-    std::vector<mooncake::Slice> slices;
-    uint64_t offset = 0;
+    auto slice = Slice{buffer, size};
 
-    while (offset < size) {
-        auto chunk_size = std::min(size - offset, kMaxSliceSize);
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
-        slices.emplace_back(Slice{chunk_ptr, chunk_size});
-        offset += chunk_size;
-    }
-
-    auto put_result = client_->Put(key, slices, config);
+    auto put_result = client_->Put(key, slice, config);
     if (!put_result) {
         return tl::unexpected(put_result.error());
     }
@@ -1019,7 +980,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
         std::string key;
         size_t original_index;
         QueryResult query_result;
-        std::vector<Slice> slices;
+        Slice slice;
         uint64_t total_size;
     };
 
@@ -1051,7 +1012,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
 
         // Calculate required buffer size
         const auto &replica = query_result_values.replicas[0];
-        uint64_t total_size = calculate_total_size(replica);
+        uint64_t total_size = getSliceSize(replica);
 
         // Validate buffer capacity
         if (sizes[i] < total_size) {
@@ -1063,30 +1024,14 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
         }
 
         // Create slices for this key's buffer
-        std::vector<Slice> key_slices;
-        uint64_t offset = 0;
-        if (replica.is_memory_replica() == false) {
-            while (offset < total_size) {
-                auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
-                void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
-                key_slices.emplace_back(Slice{chunk_ptr, chunk_size});
-                offset += chunk_size;
-            }
-        } else {
-            for (auto &handle :
-                 replica.get_memory_descriptor().buffer_descriptors) {
-                void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
-                key_slices.emplace_back(Slice{chunk_ptr, handle.size_});
-                offset += handle.size_;
-            }
-        }
+        auto key_slice = Slice{buffers[i], total_size};
 
         // Store operation info for batch processing
         valid_operations.push_back(
             {.key = key,
              .original_index = i,
              .query_result = std::move(query_result_values),
-             .slices = std::move(key_slices),
+             .slice = std::move(key_slice),
              .total_size = total_size});
 
         // Set success result (actual bytes transferred)
@@ -1101,7 +1046,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
     // Prepare batch transfer data structures
     std::vector<std::string> batch_keys;
     std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+    std::unordered_map<std::string, Slice> batch_slices;
 
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
@@ -1109,7 +1054,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
     for (const auto &op : valid_operations) {
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
-        batch_slices[op.key] = op.slices;
+        batch_slices[op.key] = op.slice;
     }
 
     // Execute batch transfer
@@ -1169,25 +1114,9 @@ int PyClient::put_from_with_metadata(const std::string &key, void *buffer,
     }
 
     // Create slices directly from the user buffer
-    std::vector<mooncake::Slice> slices;
-    // Add metadata slice
-    uint64_t metadata_offset = 0;
-    while (metadata_offset < metadata_size) {
-        auto metadata_chunk_size =
-            std::min(metadata_size - metadata_offset, kMaxSliceSize);
-        void *metadata_chunk_ptr =
-            static_cast<char *>(metadata_buffer) + metadata_offset;
-        slices.emplace_back(Slice{metadata_chunk_ptr, metadata_chunk_size});
-        metadata_offset += metadata_chunk_size;
-    }
+    auto metadata_slice = Slice{metadata_buffer, metadata_size};
+    auto data_slice = Slice{buffer, size};
 
-    uint64_t offset = 0;
-    while (offset < size) {
-        auto chunk_size = std::min(size - offset, kMaxSliceSize);
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
-        slices.emplace_back(Slice{chunk_ptr, chunk_size});
-        offset += chunk_size;
-    }
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
@@ -1339,7 +1268,7 @@ PyClient::batch_get_into_multi_buffers_internal(
         }
         // Calculate required buffer size
         const auto &replica = query_result_values.replicas[0];
-        uint64_t total_size = calculate_total_size(replica);
+        uint64_t total_size = getSliceSize(replica);
         const auto &sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
         for (auto &size : sizes) {
@@ -1393,8 +1322,7 @@ PyClient::batch_get_into_multi_buffers_internal(
     }
 
     auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                          prefer_alloc_in_same_node);
+        client_->BatchGetWhenPreferSameNode(batch_keys, batch_query_results, batch_slices);
 
     // Process transfer results
     for (size_t j = 0; j < batch_get_results.size(); ++j) {

@@ -79,7 +79,7 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 }
 
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
-    const std::string& path, std::vector<Slice>& slices, int64_t length) {
+    const std::string& path, const Slice& slice, int64_t length) {
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
@@ -87,74 +87,37 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    off_t current_offset = 0;
-    int64_t total_bytes_processed = 0;
-
     std::vector<iovec> iovs_chunk;
-    off_t chunk_start_offset = 0;
-    int64_t chunk_length = 0;
-
     auto process_chunk = [&]() -> tl::expected<void, ErrorCode> {
         if (iovs_chunk.empty()) {
             return {};
         }
 
         auto read_result = file->vector_read(
-            iovs_chunk.data(), static_cast<int>(iovs_chunk.size()),
-            chunk_start_offset);
+            iovs_chunk.data(), static_cast<int>(iovs_chunk.size()), 0);
         if (!read_result) {
-            LOG(ERROR) << "vector_read failed for chunk at offset "
-                       << chunk_start_offset << " for path: " << path
+            LOG(ERROR) << "vector_read failed for slice in path: " << path
                        << ", error: " << read_result.error();
             return tl::make_unexpected(read_result.error());
         }
-        if (*read_result != chunk_length) {
+        if (*read_result != slice.size) {
             LOG(ERROR) << "Read size mismatch for chunk in path: " << path
-                       << ", expected: " << chunk_length
+                       << ", expected: " << slice.size
                        << ", got: " << *read_result;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
 
-        total_bytes_processed += chunk_length;
-
         iovs_chunk.clear();
-        chunk_length = 0;
-
         return {};
     };
 
-    for (const auto& slice : slices) {
-        if (slice.ptr != nullptr) {
-            if (iovs_chunk.empty()) {
-                chunk_start_offset = current_offset;
-            }
-            iovs_chunk.push_back({slice.ptr, slice.size});
-            chunk_length += slice.size;
-        } else {
-            auto result = process_chunk();
-            if (!result) {
-                return result;
-            }
-
-            total_bytes_processed += slice.size;
-        }
-
-        current_offset += slice.size;
+    if (slice.ptr != nullptr) {
+        iovs_chunk.push_back({slice.ptr, slice.size});
+    } else {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto result = process_chunk();
-    if (!result) {
-        return result;
-    }
-
-    if (total_bytes_processed != length) {
-        LOG(ERROR) << "Total read size mismatch for: " << path
-                   << ", expected: " << length
-                   << ", got: " << total_bytes_processed;
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    }
-
-    return {};
+    return process_chunk();
 }
 
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
